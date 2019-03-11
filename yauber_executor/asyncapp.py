@@ -10,6 +10,8 @@ import re
 import signal
 import pamqp.specification
 import aiormq.exceptions
+import motor.motor_asyncio
+from datetime import datetime
 
 
 class AsyncAppError(Exception):
@@ -28,11 +30,23 @@ class AsyncAppMessageProcessError(AsyncAppError):
     pass
 
 
+class AppStatus:
+    IDLE = 'IDLE'
+    RUN = 'RUN'
+    ERROR = 'ERROR'
+    CRIT = 'CRIT'
+    WARN = 'WARN'
+    OFF = 'OFF'
+
+
 class AsyncApp:
     def __init__(self,
                  app_name,
                  ampq_connstr="amqp://guest:guest@localhost/",
-                 ampq_exchange='yauber_executor'
+                 ampq_exchange='yauber_executor',
+                 mongo_db='yauber_executor',
+                 mongo_connstr='mongodb://localhost',
+                 heartbeat_interval=60,
                  ):
         self.app_name = app_name
         self.ampq_connstr = ampq_connstr
@@ -42,10 +56,14 @@ class AsyncApp:
         self.ampq_exchange_obj = None
         self.ampq_rpc = None
         self.ampq_isconnected = False
+        self.heartbeat_interval = heartbeat_interval
 
         self._ampq_binded_funcs = {}
         self._is_shutting_down = False
         self.loop = None
+
+        self.mongo_client = motor.motor_asyncio.AsyncIOMotorClient(mongo_connstr)
+        self.mongo_db = self.mongo_client[mongo_db]
 
     def state_set(self, state):
         pass
@@ -67,15 +85,21 @@ class AsyncApp:
         """
         return {}
 
-    async def heartbeat(self, loop):
+    async def _heartbeat(self):
         while True:
-            log.debug('Hearbeat')
             try:
-                await asyncio.sleep(10)
-            except asyncio.CancelledError:
-                break
+                await self.on_heartbeat()
+                await self.mongo_db['app_status'].update_one({'_id': self.app_name},
+                                                             {'$set': {'heartbeat_date_utc': datetime.utcnow()}})
+            except Exception as exc:
+                log.error(f"Error writing heartbeat data to the MongoDB. Exception: {exc}")
 
-    async def main(self, loop):
+            await asyncio.sleep(self.heartbeat_interval)
+
+    async def on_heartbeat(self):
+        pass
+
+    async def main(self):
         pass
 
     async def send_message(self, topic, msg_obj):
@@ -92,6 +116,30 @@ class AsyncApp:
             return await self.ampq_rpc.call(rpc_func_name, kwargs=kwargs)
         except aiormq.exceptions.DeliveryError:
             raise AsyncAppDeliveryError(f"Called unregistered RPC function: {rpc_func_name}")
+
+    async def send_status(self, status, message):
+        current_status = {
+                '_id': self.app_name,
+                'status': status,
+                'message': message,
+                'date': datetime.now(),
+                'date_utc': datetime.utcnow(),
+                'heartbeat_date_utc': datetime.utcnow(),
+        }
+
+        log.info(f"STATUS: {status} -> {message}")
+
+        try:
+            await self.mongo_db['app_status'].replace_one({'_id': self.app_name}, current_status, upsert=True)
+        except Exception:
+            log.error("Error writing status data to the MongoDB")
+
+        try:
+            await self.send_message(f'status.{self.app_name}', current_status)
+        except AsyncAppDeliveryError:
+            log.warning("AMPQ no status listeners")
+        except Exception as exc:
+            log.error(f"Error during sending status: {exc}")
 
     async def _process_message(self, message):
         with message.process():
@@ -114,22 +162,21 @@ class AsyncApp:
                             await processor_coro
                             break
                     if not is_found:
-                        log.error(f'Routing function is not found for routing key {topic}')
-                        # TODO: report non critical error
+                        log.error(f'Routing function is not found for routing topic {topic}')
+                        await self.send_status(AppStatus.ERROR, f'Routing function is not found for routing topic {topic}')
             except AsyncAppMessageProcessError as exc:
                 log.error(f'Error in processing message\n'
                           f'\tTopic: {topic}\n'
                           f'\tProcessor: {processor_coro}\n'
                           f'\tException: {exc}')
-                # TODO: report non critical error
+                await self.send_status(AppStatus.ERROR, f'AsyncAppMessageProcessError: {topic}')
             except Exception:
                 log.exception(f'Unhandled exception in processing topic:\n'
                               f'\tTopic: {topic}\n'
                               f'\tProcessor: {processor_coro}\n'
                               f'\tMessage Obj: {msg_obj}')
-                # TODO: report critical error and status
+                await self.send_status(AppStatus.CRIT, f"Unhandled exception in processing topic: {topic}")
                 await self.shutdown()
-
 
     def _amqp_pattern_match(self, key: str, pattern: str) -> bool:
         if key == pattern:
@@ -155,7 +202,7 @@ class AsyncApp:
 
         self.ampq_isconnected = True
 
-    async def _ampq_bind_topics(self, loop):
+    async def _ampq_bind_topics(self):
         if not self.ampq_isconnected:
             log.error("AMPQ is not connected, no binding applied")
             return
@@ -193,14 +240,13 @@ class AsyncApp:
                                              lambda **kwargs: self._rpc_call_handler(rpc_key, rpc_func, **kwargs),
                                              auto_delete=True, exclusive=True)
 
-    async def shutdown(self, signal=None):
+    async def shutdown(self, sig=None):
         self._is_shutting_down = True
-        if signal is not None:
-            log.info(f'Received exit signal {signal.name}...')
-            # TODO: set status offline
+        if sig is not None:
+            log.info(f'Received exit signal {sig.name}...')
+            await self.send_status(AppStatus.OFF, f'Received exit signal {sig.name}')
         else:
             log.info(f'Received unhandled error, shutting down...')
-            # TODO: set status critical
 
         log.info('Closing connections')
         if self.ampq_connection is not None:
@@ -210,10 +256,17 @@ class AsyncApp:
             except Exception as exc:
                 log.error(f"AMPQ Connection close error: {exc}")
 
+        if self.mongo_client is not None:
+            try:
+                self.mongo_client.close()
+                log.info('MongoDB connection closed')
+            except Exception as exc:
+                log.error(f"MongoDB Connection close error: {exc}")
+
         log.info('Canceling outstanding tasks')
         tasks = []
 
-        loop = asyncio.get_event_loop()
+        loop = self.loop
 
         for t in asyncio.Task.all_tasks(loop):
             if t is not asyncio.Task.current_task(loop):
@@ -232,7 +285,7 @@ class AsyncApp:
         loop.stop()
         log.info('Shutdown complete.')
 
-    async def _run_handler(self, coro, loop, start_timeout=0):
+    async def _run_handler(self, coro, start_timeout=0):
         try:
             if start_timeout > 0:
                 log.info(f'Delayed launch {start_timeout}s of {coro}')
@@ -244,7 +297,7 @@ class AsyncApp:
                 raise exc
             else:
                 log.exception('Unhandled exception')
-                # TODO: report error and status
+                await self.send_status(AppStatus.CRIT, 'Unhandled exception!')
                 await self.shutdown()
 
     async def _rpc_call_handler(self, rpc_func_name, rpc_coro, **kwargs):
@@ -252,27 +305,28 @@ class AsyncApp:
             await rpc_coro(**kwargs)
         except Exception as exc:
             log.exception(f'RPC: {rpc_func_name}\nkwargs: {kwargs}\n')
+            await self.send_status(AppStatus.ERROR, f'RPC Exception: {rpc_func_name}')
             raise exc
 
     def run(self):
-        loop = asyncio.get_event_loop()
-
+        self.loop = loop = asyncio.get_event_loop()
         loop.set_debug(True)
 
         signals = (signal.SIGHUP, signal.SIGTERM, signal.SIGINT)
         for sig in signals:
             loop.add_signal_handler(sig, lambda s=sig: loop.create_task(self.shutdown(s)))
 
-        # Connect to RabbitMQ first
-        loop.run_until_complete(self._run_handler(self._ampq_connect(loop), loop))
+        # Connect to RabbitMQ first and report initial status
+        loop.run_until_complete(self._run_handler(self._ampq_connect(loop)))
+        loop.run_until_complete(self.send_status(AppStatus.IDLE, 'Started...'))
 
         # Listen AMPQ events and register RPC calls if available
-        loop.create_task(self._run_handler(self._ampq_bind_topics(loop), loop))
-        loop.create_task(self._run_handler(self._ampq_register_rpc(), loop))
+        loop.create_task(self._run_handler(self._ampq_bind_topics()))
+        loop.create_task(self._run_handler(self._ampq_register_rpc()))
 
         # Run main routine and heartbeat
-        loop.create_task(self._run_handler(self.main(loop), loop, start_timeout=5))
-        loop.create_task(self._run_handler(self.heartbeat(loop), loop, start_timeout=2))
+        loop.create_task(self._run_handler(self.main(), start_timeout=5))
+        loop.create_task(self._run_handler(self._heartbeat(), start_timeout=2))
 
         loop.run_forever()
 
