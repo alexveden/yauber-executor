@@ -1,3 +1,5 @@
 pika
 pymongo
 celery
+aio-pika
+motor
