@@ -64,6 +64,7 @@ class AsyncApp:
 
         self.mongo_client = motor.motor_asyncio.AsyncIOMotorClient(mongo_connstr)
         self.mongo_db = self.mongo_client[mongo_db]
+        self.state = {}
 
     def state_set(self, state):
         pass
@@ -170,6 +171,8 @@ class AsyncApp:
                           f'\tProcessor: {processor_coro}\n'
                           f'\tException: {exc}')
                 await self.send_status(AppStatus.ERROR, f'AsyncAppMessageProcessError: {topic}')
+            except asyncio.CancelledError:
+                pass
             except Exception:
                 log.exception(f'Unhandled exception in processing topic:\n'
                               f'\tTopic: {topic}\n'
@@ -302,7 +305,7 @@ class AsyncApp:
 
     async def _rpc_call_handler(self, rpc_func_name, rpc_coro, **kwargs):
         try:
-            await rpc_coro(**kwargs)
+            return await rpc_coro(**kwargs)
         except Exception as exc:
             log.exception(f'RPC: {rpc_func_name}\nkwargs: {kwargs}\n')
             await self.send_status(AppStatus.ERROR, f'RPC Exception: {rpc_func_name}')
