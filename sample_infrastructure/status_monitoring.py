@@ -1,7 +1,8 @@
 """
 Monitors statuses of all scripts in the systems and sends dummy notifications
 """
-from yauber_executor import AsyncApp, AsyncAppMessageProcessError, AppStatus
+from yauber_executor import AsyncApp, AppStatus
+
 
 class StatusMonitor(AsyncApp):
     async def on_status(self, topic, message):

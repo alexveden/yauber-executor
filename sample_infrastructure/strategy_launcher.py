@@ -65,6 +65,7 @@ class StrategyLauncherScript(AsyncApp):
             )
 
         self.state['last_quote_time'] = datetime.now()
+        # TODO: debug signal handling during execution pool! Unlimited call
         strategies_signals = await asyncio.gather(*run_strategies_tasks)
         try:
             for sig in strategies_signals:

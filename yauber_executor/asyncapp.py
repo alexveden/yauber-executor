@@ -66,11 +66,6 @@ class AsyncApp:
         self.mongo_db = self.mongo_client[mongo_db]
         self.state = {}
 
-    def state_set(self, state):
-        pass
-
-    def state_get(self, state):
-        pass
 
     def ampq_bind_funcs(self):
         """
@@ -87,13 +82,13 @@ class AsyncApp:
         return {}
 
     async def _heartbeat(self):
-        while True:
+        while not self._is_shutting_down:
             try:
                 await self.on_heartbeat()
                 await self.mongo_db['app_status'].update_one({'_id': self.app_name},
                                                              {'$set': {'heartbeat_date_utc': datetime.utcnow()}})
             except Exception as exc:
-                log.error(f"Error writing heartbeat data to the MongoDB. Exception: {exc}")
+                log.exception(f"Error writing heartbeat data to the MongoDB. Exception: {exc}")
 
             await asyncio.sleep(self.heartbeat_interval)
 
@@ -140,21 +135,30 @@ class AsyncApp:
         except AsyncAppDeliveryError:
             log.warning("AMPQ no status listeners")
         except Exception as exc:
-            log.error(f"Error during sending status: {exc}")
+            log.exception(f"Error during sending status: {exc}")
 
     async def _process_message(self, message):
         with message.process():
-            #
-            # Try fast path
+
             topic = message.routing_key
-            msg_obj = pickle.loads(message.body)
+            msg_obj = message.body
             processor_coro = "<undefined>"
+
+            # Try message integrity
+            try:
+                msg_obj = pickle.loads(message.body)
+            except:
+                log.exception(f'Corrupted message format {message.body}')
+                await self.send_status(AppStatus.ERROR, f'Corrupted message format, see logs...')
+                return
 
             try:
                 if topic in self._ampq_binded_funcs:
-                    processor_coro = self._ampq_binded_funcs[topic](topic, message)
+                    # Try fast search
+                    processor_coro = self._ampq_binded_funcs[topic](topic, msg_obj)
                     await processor_coro
                 else:
+                    # Try find handler by regex
                     is_found = False
                     for bind_key, bind_coro in self._ampq_binded_funcs.items():
                         if self._amqp_pattern_match(topic, bind_key):
@@ -181,7 +185,8 @@ class AsyncApp:
                 await self.send_status(AppStatus.CRIT, f"Unhandled exception in processing topic: {topic}")
                 await self.shutdown()
 
-    def _amqp_pattern_match(self, key: str, pattern: str) -> bool:
+    @staticmethod
+    def _amqp_pattern_match(key: str, pattern: str) -> bool:
         if key == pattern:
             return True
         replaced = pattern.replace(r'*', r'([^.]+)').replace(r'#', r'([^.]+.?)+')
@@ -195,7 +200,6 @@ class AsyncApp:
 
         # Creating a channel
         self.ampq_channel = await self.ampq_connection.channel()
-        # await channel.set_qos(prefetch_count=1)
 
         # Declare an exchange
         self.ampq_exchange_obj = await self.ampq_channel.declare_exchange(self.ampq_exchange_name, ExchangeType.TOPIC)
@@ -207,43 +211,48 @@ class AsyncApp:
 
     async def _ampq_bind_topics(self):
         if not self.ampq_isconnected:
-            log.error("AMPQ is not connected, no binding applied")
-            return
-        # Declaring queue
-        queue = await self.ampq_channel.declare_queue(exclusive=True)
+            raise RuntimeError('AMPQ is not connected')
 
         binding_keys_dict = self.ampq_bind_funcs()
 
-        for binding_key, binding_coro in binding_keys_dict.items():
-            await queue.bind(self.ampq_exchange_obj, routing_key=binding_key)
-            log.debug(f'Listening to: {binding_key} on {binding_coro}')
-            self._ampq_binded_funcs[binding_key] = binding_coro
+        if binding_keys_dict is not None and len(binding_keys_dict) > 0:
+            # Declaring queue
+            queue = await self.ampq_channel.declare_queue(exclusive=True)
 
-        def async_to_callback(coro):
-            def callback(*args, **kwargs):
-                asyncio.ensure_future(coro(*args, **kwargs))
-            return callback
+            # Bind topics to processor functions
+            for binding_key, binding_coro in binding_keys_dict.items():
+                await queue.bind(self.ampq_exchange_obj, routing_key=binding_key)
+                log.debug(f'Listening to: {binding_key} on {binding_coro}')
+                self._ampq_binded_funcs[binding_key] = binding_coro
 
-        # Start listening the queue with name 'task_queue'
-        await queue.consume(async_to_callback(self._process_message))
+            def async_to_callback(coro):
+                def callback(*args, **kwargs):
+                    asyncio.ensure_future(coro(*args, **kwargs))
+                return callback
+
+            # Start listening the queue
+            await queue.consume(async_to_callback(self._process_message))
 
     async def _ampq_register_rpc(self):
         if not self.ampq_isconnected:
-            log.error("AMPQ is not connected, no RPC applied")
-            return
+            raise RuntimeError("AMPQ is not connected, no RPC applied")
 
         rpc_funcs_dict = self.ampq_rpc_funcs()
 
-        if len(rpc_funcs_dict) > 0:
+        if rpc_funcs_dict is not None and len(rpc_funcs_dict) > 0:
 
             for rpc_key, rpc_func in rpc_funcs_dict.items():
                 log.debug(f"Registering RPC {rpc_key} -> {rpc_func}")
 
                 await self.ampq_rpc.register(rpc_key,
-                                             lambda **kwargs: self._rpc_call_handler(rpc_key, rpc_func, **kwargs),
+                                             rpc_func,
                                              auto_delete=True, exclusive=True)
 
     async def shutdown(self, sig=None):
+        if self._is_shutting_down:
+            # Avoid concurrent shutdown
+            return
+
         self._is_shutting_down = True
         if sig is not None:
             log.info(f'Received exit signal {sig.name}...')
@@ -302,14 +311,6 @@ class AsyncApp:
                 log.exception('Unhandled exception')
                 await self.send_status(AppStatus.CRIT, 'Unhandled exception!')
                 await self.shutdown()
-
-    async def _rpc_call_handler(self, rpc_func_name, rpc_coro, **kwargs):
-        try:
-            return await rpc_coro(**kwargs)
-        except Exception as exc:
-            log.exception(f'RPC: {rpc_func_name}\nkwargs: {kwargs}\n')
-            await self.send_status(AppStatus.ERROR, f'RPC Exception: {rpc_func_name}')
-            raise exc
 
     def run(self):
         self.loop = loop = asyncio.get_event_loop()
