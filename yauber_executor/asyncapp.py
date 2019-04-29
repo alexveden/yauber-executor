@@ -39,6 +39,12 @@ class AppStatus:
     OFF = 'OFF'
 
 
+def async_to_callback(coro):
+    def callback(*args, **kwargs):
+        asyncio.ensure_future(coro(*args, **kwargs))
+    return callback
+
+
 class AsyncApp:
     def __init__(self,
                  app_name,
@@ -225,11 +231,6 @@ class AsyncApp:
                 log.debug(f'Listening to: {binding_key} on {binding_coro}')
                 self._ampq_binded_funcs[binding_key] = binding_coro
 
-            def async_to_callback(coro):
-                def callback(*args, **kwargs):
-                    asyncio.ensure_future(coro(*args, **kwargs))
-                return callback
-
             # Start listening the queue
             await queue.consume(async_to_callback(self._process_message))
 
@@ -287,28 +288,28 @@ class AsyncApp:
                     tasks.append(t)
 
         if len(tasks) > 0:
-            try:
-                await asyncio.gather(*tasks)
-            except asyncio.CancelledError:
-                pass
-            except Exception as exc:
-                log.error(f"Tasks cancellation error: {exc}")
+            cancellation_results = await asyncio.gather(*tasks, return_exceptions=True)
+
+            for t, result in zip(tasks, cancellation_results):
+                if not isinstance(result, asyncio.CancelledError) and isinstance(result, Exception):
+                    log.exception(f'{t._coro} Cancel ERROR:', exc_info=result)
 
         loop.stop()
+        # loop.close()
         log.info('Shutdown complete.')
 
-    async def _run_handler(self, coro, start_timeout=0):
+    async def _run_handler(self, coro, start_delay=0):
         try:
-            if start_timeout > 0:
-                log.info(f'Delayed launch {start_timeout}s of {coro}')
-                await asyncio.sleep(start_timeout)
-
+            if start_delay > 0:
+                log.info(f'Delayed launch {start_delay}s of {coro}')
+                await asyncio.sleep(start_delay)
             await coro
+        except asyncio.CancelledError:
+            raise
         except Exception as exc:
-            if self._is_shutting_down:
-                raise exc
-            else:
-                log.exception('Unhandled exception')
+            log.exception(f'Unhandled exception in {coro}')
+
+            if not self._is_shutting_down:
                 await self.send_status(AppStatus.CRIT, 'Unhandled exception!')
                 await self.shutdown()
 
@@ -329,8 +330,8 @@ class AsyncApp:
         loop.create_task(self._run_handler(self._ampq_register_rpc()))
 
         # Run main routine and heartbeat
-        loop.create_task(self._run_handler(self.main(), start_timeout=5))
-        loop.create_task(self._run_handler(self._heartbeat(), start_timeout=2))
+        loop.create_task(self._run_handler(self.main(), start_delay=5))
+        loop.create_task(self._run_handler(self._heartbeat(), start_delay=2))
 
         loop.run_forever()
 

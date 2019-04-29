@@ -561,6 +561,226 @@ class AsyncAppTestCase(unittest.TestCase):
             self.assertEqual(6, _run(app.call_rpc('test.add', x=3, y=3)))
             self.assertRaises(ZeroDivisionError, _run, app.call_rpc('test.div', a=1, z=0))
 
+    @mock.patch('motor.motor_asyncio.AsyncIOMotorClient')
+    # Patch arguments MUST be in reverse order!!!
+    def test_shutdown_already_shutting_down(self, mock_motor_client):
+        loop = asyncio.get_event_loop()
+        app = AsyncApp('test_app', ampq_exchange='test_exchange', ampq_connstr="amqp://guest:guest@localhost/")
+
+        app._is_shutting_down = True
+        app.loop = mock.MagicMock()
+        _run(app.shutdown(sig=None))
+
+        self.assertEqual(app.loop.stop.called, False)
+
+    @mock.patch('motor.motor_asyncio.AsyncIOMotorClient')
+    # Patch arguments MUST be in reverse order!!!
+    def test_shutdown(self, mock_motor_client):
+        loop = asyncio.get_event_loop()
+        app = AsyncApp('test_app', ampq_exchange='test_exchange', ampq_connstr="amqp://guest:guest@localhost/")
+
+        app.loop = mock.MagicMock(loop)
+        app.ampq_connection = mock.MagicMock()
+        app.ampq_connection.close = AsyncMock()
+        _run(app.shutdown(sig=None))
+
+        self.assertEqual(True, app._is_shutting_down)
+        self.assertEqual(True, app.loop.stop.called)
+        #self.assertEqual(True, app.loop.close.called)
+        self.assertEqual(True, app.mongo_client.close.called)
+        self.assertEqual(True, app.ampq_connection.close.mock.called)
+
+    @mock.patch('motor.motor_asyncio.AsyncIOMotorClient')
+    # Patch arguments MUST be in reverse order!!!
+    def test_shutdown_signal(self, mock_motor_client):
+        loop = asyncio.get_event_loop()
+        app = AsyncApp('test_app', ampq_exchange='test_exchange', ampq_connstr="amqp://guest:guest@localhost/")
+        app.loop = loop
+        with mock.patch.object(AsyncApp, 'send_status', new=AsyncMock()) as mock_send_status:
+            app.loop.create_task(app.shutdown(sig=signal.SIGINT))
+            app.loop.run_forever()
+            self.assertEqual(mock_send_status.mock.call_args[0][1], AppStatus.OFF)
+
+
+    @mock.patch('motor.motor_asyncio.AsyncIOMotorClient')
+    # Patch arguments MUST be in reverse order!!!
+    def test_shutdown_mongo_ampq_exception(self, mock_motor_client):
+        loop = asyncio.get_event_loop()
+        app = AsyncApp('test_app', ampq_exchange='test_exchange', ampq_connstr="amqp://guest:guest@localhost/")
+
+        app.loop = mock.MagicMock(loop)
+        app.ampq_connection = mock.MagicMock()
+        app.ampq_connection.close = AsyncMock()
+        def _exc():
+            raise RuntimeError()
+        app.mongo_client.close.side_effect = _exc
+        app.ampq_connection.close.mock.side_effect = _exc
+
+        _run(app.shutdown(sig=None))
+
+        self.assertEqual(True, app._is_shutting_down)
+        self.assertEqual(True, app.loop.stop.called)
+        self.assertEqual(True, app.mongo_client.close.called)
+        self.assertEqual(True, app.ampq_connection.close.mock.called)
+
+
+    @mock.patch('motor.motor_asyncio.AsyncIOMotorClient')
+    # Patch arguments MUST be in reverse order!!!
+    def test_shutdown_cancel_tasks(self, mock_motor_client):
+        app = AsyncApp('test_app', ampq_exchange='test_exchange', ampq_connstr="amqp://guest:guest@localhost/")
+
+        async def task1():
+            print('task1')
+            await asyncio.sleep(5)
+
+        async def task2():
+            try:
+                print('task2')
+                await asyncio.sleep(10)
+            except Exception as exc:
+                print(exc)
+                await asyncio.sleep(1)
+
+        async def task3():
+            try:
+                print('task3')
+                await asyncio.sleep(10)
+            except asyncio.CancelledError:
+                raise ValueError('Expected cancelled')
+
+        app.loop = asyncio.get_event_loop()
+
+        t1 = app.loop.create_task(task1())
+        t2 = app.loop.create_task(task2())
+        t3 = app.loop.create_task(task3())
+        app.loop.create_task(app._run_handler(app.shutdown(), start_delay=1))
+        app.loop.run_forever()
+
+        self.assertEqual(t1._state, 'CANCELLED')
+        self.assertEqual(t2._state, 'FINISHED')
+        self.assertEqual(t3._state, 'FINISHED')
+
+    @mock.patch('motor.motor_asyncio.AsyncIOMotorClient')
+    # Patch arguments MUST be in reverse order!!!
+    def test__run_handler(self, mock_motor_client):
+        app = AsyncApp('test_app', ampq_exchange='test_exchange', ampq_connstr="amqp://guest:guest@localhost/")
+
+        with mock.patch('asyncio.sleep', new=AsyncMock()) as mock_aio_sleep:
+            coro = AsyncMock()
+            _run(app._run_handler(coro('test', True, arg1='b'), start_delay=0))
+            self.assertEqual(False, mock_aio_sleep.mock.called)
+            self.assertEqual(coro.mock.call_args[0], ('test', True))
+            self.assertEqual(coro.mock.call_args[1], {'arg1': 'b'})
+
+    @mock.patch('motor.motor_asyncio.AsyncIOMotorClient')
+    # Patch arguments MUST be in reverse order!!!
+    def test__run_handler_start_delay(self, mock_motor_client):
+        app = AsyncApp('test_app', ampq_exchange='test_exchange', ampq_connstr="amqp://guest:guest@localhost/")
+
+        with mock.patch('asyncio.sleep', new=AsyncMock()) as mock_aio_sleep:
+            coro = AsyncMock()
+            _run(app._run_handler(coro('test', True, arg1='b'), start_delay=1))
+            self.assertEqual(True, mock_aio_sleep.mock.called)
+            self.assertEqual((1,), mock_aio_sleep.mock.call_args[0])
+            self.assertEqual(coro.mock.call_args[0], ('test', True))
+            self.assertEqual(coro.mock.call_args[1], {'arg1': 'b'})
+
+    @mock.patch('motor.motor_asyncio.AsyncIOMotorClient')
+    # Patch arguments MUST be in reverse order!!!
+    def test__run_handler_exceptions(self, mock_motor_client):
+        app = AsyncApp('test_app', ampq_exchange='test_exchange', ampq_connstr="amqp://guest:guest@localhost/")
+
+        with mock.patch('asyncio.sleep', new=AsyncMock()) as mock_aio_sleep, \
+            mock.patch.object(AsyncApp, 'send_status', new=AsyncMock()) as mock_send_status, \
+            mock.patch.object(AsyncApp, 'shutdown', new=AsyncMock()) as mock_shutdown:
+
+                async def task():
+                    await asyncio.sleep(1)
+                    raise ValueError('expected error')
+
+                _run(app._run_handler(task(), start_delay=0))
+
+                self.assertEqual(True, mock_shutdown.mock.called)
+                self.assertEqual(mock_send_status.mock.call_args[0][1], AppStatus.CRIT)
+
+
+    @mock.patch('motor.motor_asyncio.AsyncIOMotorClient')
+    # Patch arguments MUST be in reverse order!!!
+    def test__run_handler_exceptions_cancellation(self, mock_motor_client):
+        app = AsyncApp('test_app', ampq_exchange='test_exchange', ampq_connstr="amqp://guest:guest@localhost/")
+
+        with mock.patch.object(AsyncApp, 'send_status', new=AsyncMock()) as mock_send_status:
+
+            async def task1():
+                print("task1")
+                await asyncio.sleep(2)
+                raise ValueError('expected error')
+
+            async def task2():
+                print("task2")
+                while True:
+                    await asyncio.sleep(1)
+
+            app.loop = asyncio.get_event_loop()
+
+            app.loop.create_task(app._run_handler(task1(), start_delay=0))
+            app.loop.create_task(app._run_handler(task2(), start_delay=0))
+            app.loop.run_forever()
+
+            self.assertEqual(mock_send_status.mock.call_args[0][1], AppStatus.CRIT)
+
+    @mock.patch('motor.motor_asyncio.AsyncIOMotorClient')
+    # Patch arguments MUST be in reverse order!!!
+    def test_run(self, mock_motor_client):
+
+
+        with mock.patch.object(AsyncApp, 'send_status', new=AsyncMock()) as mock_send_status, \
+             mock.patch.object(AsyncApp, '_heartbeat', new=AsyncMock()) as mock_heartbeat, \
+             mock.patch.object(AsyncApp, '_ampq_connect', new=AsyncMock()) as mock__ampq_connect, \
+             mock.patch.object(AsyncApp, '_ampq_bind_topics', new=AsyncMock()) as mock__ampq_bind_topics, \
+             mock.patch.object(AsyncApp, '_ampq_register_rpc', new=AsyncMock()) as mock__ampq_register_rpc:
+
+            app = AsyncApp('test_app', ampq_exchange='test_exchange', ampq_connstr="amqp://guest:guest@localhost/")
+
+            async def _main():
+                print('main')
+                raise RuntimeError('End endless loop')
+
+            app.main = _main
+
+            app.run()
+
+            self.assertEqual(mock_send_status.mock.call_args_list[0][0][1], AppStatus.IDLE)
+            self.assertEqual(mock__ampq_connect.mock.call_args[0], (app, app.loop))
+            self.assertEqual(mock__ampq_connect.mock.call_args[1], {})
+
+            self.assertEqual(mock__ampq_bind_topics.mock.call_args[0], (app,))
+            self.assertEqual(mock__ampq_bind_topics.mock.call_args[1], {})
+
+            self.assertEqual(mock__ampq_register_rpc.mock.call_args[0], (app,))
+            self.assertEqual(mock__ampq_register_rpc.mock.call_args[1], {})
+
+            self.assertEqual(mock_heartbeat.mock.call_args[0], (app,))
+            self.assertEqual(mock_heartbeat.mock.call_args[1], {})
+
+            self.assertEqual(mock_send_status.mock.call_args_list[1][0][1], AppStatus.CRIT)
+
+    def test_async_to_callback(self):
+
+        async def add(x, y):
+            raise RuntimeError()
+
+        call_back = async_to_callback(add)
+
+        async def _run_call():
+            call_back(2,3)
+
+        loop = asyncio.get_event_loop()
+        loop.run_until_complete(_run_call())
+
+
+
+
 
 if __name__ == '__main__':
     unittest.main()
