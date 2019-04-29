@@ -4,7 +4,7 @@ from datetime import datetime
 
 
 class YaUberLogger(logging.Logger):
-    def __init__(self, global_log_name):
+    def __init__(self, global_log_name, log_base_dir='logs'):
         super().__init__(global_log_name)
 
         self.logger_name = 'yauber_framework'
@@ -14,22 +14,29 @@ class YaUberLogger(logging.Logger):
         #
         # Global settings
         #
+        self.base_dir = log_base_dir
         self.log_level = logging.DEBUG
         self.setup(self.logger_class, self.logger_name)
 
-    def setup(self, logger_class, name, to_file=False, log_level=None):
+    def setup(self, logger_class, name, to_file=False, log_level=None, file_mode='a'):
         self.logger_class = logger_class
 
         if to_file:
-            self.log_dir = os.path.join(os.path.dirname(os.path.realpath(__file__)), '..', 'logs')
-            if not os.path.exists(self.log_dir):
+            self.log_dir = self.base_dir
+            try:
                 os.mkdir(self.log_dir)
+            except FileExistsError:
+                pass
 
-            if not os.path.exists(os.path.join(self.log_dir, f'{datetime.now():%Y-%m-%d}')):
+            try:
                 os.mkdir(os.path.join(self.log_dir, f'{datetime.now():%Y-%m-%d}'))
+            except FileExistsError:
+                pass
 
-            if not os.path.exists(os.path.join(self.log_dir, f'{datetime.now():%Y-%m-%d}', self.logger_class)):
+            try:
                 os.mkdir(os.path.join(self.log_dir, f'{datetime.now():%Y-%m-%d}', self.logger_class))
+            except FileExistsError:
+                pass
 
         for hdlr in self.logger.handlers[:]:
             try:
@@ -50,7 +57,9 @@ class YaUberLogger(logging.Logger):
             handler_file = logging.FileHandler(os.path.join(self.log_dir,
                                                             f'{datetime.now():%Y-%m-%d}',
                                                             self.logger_class,
-                                                            f'{name}.log'))
+                                                            f'{name}.log'),
+                                               mode=file_mode
+                                               )
             handler_file.setFormatter(formatter)
             self.logger.addHandler(handler_file)
 
@@ -61,4 +70,4 @@ class YaUberLogger(logging.Logger):
         self.logger.addHandler(handler_console)
 
 
-log = YaUberLogger('yauber_executor')
+log = YaUberLogger('yauber_executor', log_base_dir=os.path.join(os.path.dirname(os.path.realpath(__file__)), '..', 'logs'))
