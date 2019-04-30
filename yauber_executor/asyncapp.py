@@ -104,6 +104,9 @@ class AsyncApp:
     async def main(self):
         pass
 
+    async def initialize(self):
+        pass
+
     async def send_message(self, topic, msg_obj):
         serialized_msg = pickle.dumps(msg_obj)
         message = Message(serialized_msg, delivery_mode=DeliveryMode.PERSISTENT)
@@ -322,6 +325,7 @@ class AsyncApp:
             loop.add_signal_handler(sig, lambda s=sig: loop.create_task(self.shutdown(s)))
 
         # Connect to RabbitMQ first and report initial status
+        loop.run_until_complete(self.initialize())
         loop.run_until_complete(self._run_handler(self._ampq_connect(loop)))
         loop.run_until_complete(self.send_status(AppStatus.IDLE, 'Started...'))
 
