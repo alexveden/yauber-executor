@@ -11,6 +11,8 @@ from unittest import mock
 import motor.motor_asyncio
 import asyncio
 import pamqp.specification
+import logging
+
 
 def _run(coro):
     """
@@ -54,6 +56,15 @@ class AsyncAppTestCase(unittest.TestCase):
         self.assertEqual(mock_motor_client.mock_calls[1][1], ('mongo_db',))
 
         pass
+
+    @mock.patch('motor.motor_asyncio.AsyncIOMotorClient')
+    # Patch arguments MUST be in reverse order!!!
+    def test__logging_setup(self, mock_motor_client):
+        app = AsyncApp('test_app', heartbeat_interval=111)
+
+        with mock.patch.object(log, 'setup') as mock_log:
+            app.logging_setup('test', 'app', logging.INFO, False, 'w')
+            self.assertEqual(mock_log.call_args[0], ('test', 'app', False, logging.INFO, 'w'))
 
     @mock.patch('motor.motor_asyncio.AsyncIOMotorClient')
     def test_ampq_bind_funcs(self, mock_motor_client):

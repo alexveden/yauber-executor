@@ -72,6 +72,17 @@ class AsyncApp:
         self.mongo_db = self.mongo_client[mongo_db]
         self.state = {}
 
+    def logging_setup(self, class_name, app_name, log_level, to_file=True, file_mode='a'):
+        """
+        Manage app logging
+        :param class_name: global type of script (e.g. 'execution', 'data', 'core', etc)
+        :param app_name: unique application name
+        :param log_level: log verbosity (logging.DEBUG, logging.INFO, etc..)
+        :param to_file: if True write to file
+        :param file_mode: 'a' - for appending, 'w' - for rewriting
+        :return: Nothing
+        """
+        log.setup(class_name, app_name, to_file, log_level, file_mode)
 
     def ampq_bind_funcs(self):
         """
