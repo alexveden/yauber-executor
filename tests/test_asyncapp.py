@@ -109,6 +109,70 @@ class AsyncAppTestCase(unittest.TestCase):
 
     @mock.patch('motor.motor_asyncio.AsyncIOMotorClient')
     # Patch arguments MUST be in reverse order!!!
+    def test__heartbeat_custom_values(self, mock_motor_client):
+        app = AsyncApp('test_app', heartbeat_interval=111)
+
+        with mock.patch.object(AsyncApp, 'on_heartbeat', new=AsyncMock()) as mock_on_heartbeat, \
+                mock.patch('asyncio.sleep', new=AsyncMock()) as mock_aio_sleep, \
+                mock.patch('motor.core.AgnosticCollection.update_one', new=AsyncMock()) as mock_update_one:
+            _mock_update_one = mock.MagicMock()
+            _mock_update_one.update_one = mock_update_one
+            app.mongo_db.__getitem__.return_value = _mock_update_one
+
+            # Magic trick to stop endless loop!
+            def onhbt(_self):
+                _self._is_shutting_down = True
+                return {'test': True}
+
+            mock_on_heartbeat.mock.side_effect = onhbt
+
+            _run(app._heartbeat())
+
+            self.assertEqual(mock_on_heartbeat.mock.called, True)
+            self.assertEqual(mock_update_one.mock.called, True)
+
+            self.assertEqual(mock_update_one.mock.call_args[0][0], {'_id': 'test_app'})
+
+            self.assertTrue('$set' in mock_update_one.mock.call_args[0][1])
+            self.assertTrue('heartbeat_date_utc' in mock_update_one.mock.call_args[0][1]['$set'])
+            self.assertEqual(True, mock_update_one.mock.call_args[0][1]['$set']['test'])
+
+            self.assertEqual(mock_aio_sleep.mock.call_args[0], (111,))
+
+    @mock.patch('motor.motor_asyncio.AsyncIOMotorClient')
+    # Patch arguments MUST be in reverse order!!!
+    def test__heartbeat_custom_values_silent_loggin(self, mock_motor_client):
+        app = AsyncApp('test_app', heartbeat_interval=111)
+
+        with mock.patch.object(AsyncApp, 'on_heartbeat', new=AsyncMock()) as mock_on_heartbeat, \
+                mock.patch('asyncio.sleep', new=AsyncMock()) as mock_aio_sleep, \
+                mock.patch('motor.core.AgnosticCollection.update_one', new=AsyncMock()) as mock_update_one:
+            _mock_update_one = mock.MagicMock()
+            _mock_update_one.update_one = mock_update_one
+            app.mongo_db.__getitem__.return_value = _mock_update_one
+
+            # Magic trick to stop endless loop!
+            def onhbt(_self):
+                _self._is_shutting_down = True
+                return 'test'
+
+            mock_on_heartbeat.mock.side_effect = onhbt
+
+            _run(app._heartbeat())
+
+            self.assertEqual(mock_on_heartbeat.mock.called, True)
+            self.assertEqual(mock_update_one.mock.called, True)
+
+            self.assertEqual(mock_update_one.mock.call_args[0][0], {'_id': 'test_app'})
+
+            self.assertTrue('$set' in mock_update_one.mock.call_args[0][1])
+            self.assertTrue('heartbeat_date_utc' in mock_update_one.mock.call_args[0][1]['$set'])
+            self.assertTrue('test' not in mock_update_one.mock.call_args[0][1]['$set'])
+
+            self.assertEqual(mock_aio_sleep.mock.call_args[0], (111,))
+
+    @mock.patch('motor.motor_asyncio.AsyncIOMotorClient')
+    # Patch arguments MUST be in reverse order!!!
     def test__heartbeat_exception(self, mock_motor_client):
         app = AsyncApp('test_app', heartbeat_interval=111)
 
@@ -137,7 +201,7 @@ class AsyncAppTestCase(unittest.TestCase):
         app = AsyncApp('test_app', heartbeat_interval=111)
         result = _run(app.on_heartbeat())
 
-        self.assertEqual(result, None)
+        self.assertEqual(result, {})
 
     @mock.patch('motor.motor_asyncio.AsyncIOMotorClient')
     # Patch arguments MUST be in reverse order!!!

@@ -12,6 +12,7 @@ import pamqp.specification
 import aiormq.exceptions
 import motor.motor_asyncio
 from datetime import datetime
+from typing import Any, Dict, Coroutine
 
 
 class AsyncAppError(Exception):
@@ -84,14 +85,14 @@ class AsyncApp:
         """
         log.setup(class_name, app_name, to_file, log_level, file_mode)
 
-    def ampq_bind_funcs(self):
+    def ampq_bind_funcs(self) -> Dict[str, Coroutine]:
         """
         Initial binding of AMQP message topics to processors
         :return:
         """
         return {}
 
-    def ampq_rpc_funcs(self):
+    def ampq_rpc_funcs(self) -> Dict[str, Coroutine]:
         """
         Dictionary of system wide RPC function that script exposes
         :return:
@@ -101,24 +102,52 @@ class AsyncApp:
     async def _heartbeat(self):
         while not self._is_shutting_down:
             try:
-                await self.on_heartbeat()
+                res_dict = await self.on_heartbeat()
+                values = {'heartbeat_date_utc': datetime.utcnow()}
+                if res_dict is not None:
+                    if not isinstance(res_dict, dict):
+                        log.error('self.on_heartbeat() must return a dictionary or None')
+                    else:
+                        for k, v in res_dict.items():
+                            values[k] = v
+
                 await self.mongo_db['app_status'].update_one({'_id': self.app_name},
-                                                             {'$set': {'heartbeat_date_utc': datetime.utcnow()}})
+                                                             {'$set': values})
             except Exception as exc:
                 log.exception(f"Error writing heartbeat data to the MongoDB. Exception: {exc}")
 
             await asyncio.sleep(self.heartbeat_interval)
 
-    async def on_heartbeat(self):
-        pass
+    async def on_heartbeat(self) -> Dict[str, Any]:
+        """
+        Periodic script self-health check and status reporting
+        :return: key/value dictionary, must have string keys without dots and values must be comparible with MongoDB collection types
+        """
+        return {}
 
     async def main(self):
+        """
+        Main function of the app
+        :return:
+        """
         pass
 
     async def initialize(self):
+        """
+        Initialization of child class of AsyncApp, this method is called before main() and any events subscription.
+        Useful for class attributes definition
+        :return:
+        """
         pass
 
-    async def send_message(self, topic, msg_obj):
+    async def send_message(self, topic: str, msg_obj: Any):
+        """
+        Send message across AMPQ
+        :param topic: message topic
+        :param msg_obj: any but must be eligible for pickling
+        :return: Nothing
+        :raises: AsyncAppDeliveryError - if no other apps listening
+        """
         serialized_msg = pickle.dumps(msg_obj)
         message = Message(serialized_msg, delivery_mode=DeliveryMode.PERSISTENT)
         result = await self.ampq_exchange_obj.publish(message, routing_key=topic)
@@ -127,13 +156,28 @@ class AsyncApp:
             # Message is not delivered
             raise AsyncAppDeliveryError(f"Message is not delivered. AMPQ result: {result}")
 
-    async def call_rpc(self, rpc_func_name, **kwargs):
+    async def call_rpc(self, rpc_func_name, **kwargs) -> Any:
+        """
+        Call remote RPC function of other AsyncApp via AMPQ
+        :param rpc_func_name: unique name of function
+        :param kwargs: function kwargs
+        :return: any
+        :raises: Any exception raised by remote function
+        :raises: AsyncAppDeliveryError - if no other apps listening
+        """
         try:
             return await self.ampq_rpc.call(rpc_func_name, kwargs=kwargs)
         except aiormq.exceptions.DeliveryError:
             raise AsyncAppDeliveryError(f"Called unregistered RPC function: {rpc_func_name}")
 
     async def send_status(self, status, message):
+        """
+        Send status message via AMPQ
+        :param status: AppStatus.<> constant
+        :param message: any pickleable
+        :return: nothing
+        :raises: nothing (catches all) but writes to log
+        """
         current_status = {
                 '_id': self.app_name,
                 'status': status,
